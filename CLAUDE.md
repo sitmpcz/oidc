@@ -10,51 +10,71 @@ This is a Nette framework extension library (`sitmpcz/oidc`) that integrates Ope
 
 ### Core Components
 
-The library consists of two main components:
-
 1. **OpenIDExtension** (`src/DI/OpenIDExtension.php`): Nette DI extension that registers the OpenID client service
    - Validates configuration using Nette Schema
-   - Accepts: `issuerUrl`, `clientId`, `clientSecret`, `redirectUri` (optional), `postLogoutRedirectUri`, `backchannelLogoutUri`, `scopes`
+   - Accepts: `issuerUrl`, `clientId`, `clientSecret` (nullable — supports public PKCE clients), `redirectUri`, `postLogoutRedirectUri`, `backchannelLogoutUri`, `scopes`
    - Default scopes: `['openid', 'profile', 'email']`
    - All URI parameters support relative paths (domain is added automatically)
 
 2. **OpenIDClientService** (`src/Security/OpenIDClientService.php`): Main service handling OIDC flows
-   - Builds OIDC client from `facile-it/php-openid-client`
+   - Builds OIDC client from `facile-it/php-openid-client` in the constructor (IssuerBuilder fetches OIDC discovery document at startup)
    - Manages authorization flow and token handling
-   - Stores user info and refresh tokens in Nette session under 'oidc' section
-   - Key methods:
-     - `getAuthorizationUrl()`: Returns the authorization redirect URL
-     - `handleCallback()`: Processes OIDC callback, validates tokens, retrieves user info
-     - `refreshToken()`: Refreshes access tokens using stored refresh token
+   - Stores user info and tokens in Nette session under the `'oidc'` section
+   - Public methods:
+     - `getAuthorizationUrl()`: Builds authorization URL, manually overrides the `scope` parameter (parses/rebuilds the URL)
+     - `handleCallback()`: Processes OIDC callback, validates tokens, stores `userInfo`/`refreshToken`/`idToken` in session; throws `RuntimeException('Unauthorized')` if no ID token
+     - `refreshToken()`: Refreshes access tokens using the stored refresh token; returns `bool`
+     - `getLogoutUrl(?string $idToken)`: Returns OIDC provider end-session URL; throws `RuntimeException` if provider has no `end_session_endpoint`
+     - `logout()`: Clears local session (`userInfo`, `refreshToken`, `idToken`)
+     - `getIdToken()`: Returns the stored ID token from session
+     - `handleBackchannelLogout(string $logoutToken)`: Validates JWT logout token and clears session if `sid`/`sub` matches; wraps all exceptions as `RuntimeException`
 
 ### Session Management
 
-The service uses Nette's session to persist:
-- `userInfo`: Complete user information from the OIDC provider
-- `refreshToken`: OAuth2 refresh token for token renewal
-- `idToken`: ID token for logout operations
+The `'oidc'` session section persists:
+- `userInfo`: Complete user info array from the OIDC provider
+- `refreshToken`: OAuth2 refresh token
+- `idToken`: ID token (needed for `getLogoutUrl()` and backchannel logout matching)
 
 ### Logout Mechanisms
 
-The service supports two types of logout:
+1. **Front-channel logout**: `$oidc->logout()` + `$oidc->getLogoutUrl($idToken)` — clears local session and redirects to provider
+2. **Backchannel logout**: Provider sends POST with `logout_token` JWT to the configured `backchannelLogoutUri`
+   - `handleBackchannelLogout()` validates the token per [OIDC Back-Channel Logout spec](https://openid.net/specs/openid-connect-backchannel-1_0.html)
+   - Matches session by `sid` (session ID) or `sub` (subject/user ID)
+   - Only clears the current session — does **not** search across all sessions (see Redis note below)
 
-1. **Front-channel logout**: User-initiated logout via `getLogoutUrl()` and `logout()`
-2. **Backchannel logout**: Provider-initiated logout when user logs out from another application
-   - Endpoint receives POST with `logout_token` JWT
-   - Token is validated according to OIDC Back-Channel Logout spec
-   - Session is matched by `sid` (session ID) or `sub` (subject/user ID)
-   - Implements automatic single sign-out across all connected applications
+### Redis Sessions and Backchannel Logout
+
+When using Redis for session storage (`contributte/redis`), backchannel logout requires a different approach because `handleBackchannelLogout()` only sees the current request's session, not all active sessions. The pattern from README:
+
+1. Decode the `logout_token` JWT manually (base64url decode payload)
+2. Extract `sid`/`sub` claims
+3. Iterate all Redis session keys, deserialize each, parse the stored `idToken` from the `oidc` section
+4. Match `sid`/`sub` and delete matching sessions directly from Redis
+
+The PHP session data format for Redis is: `oidc|a:3:{...}`. Extract `idToken` with regex:
+```
+s:7:"idToken";s:\d+:"([^"]+)"
+```
+Then base64url-decode the JWT payload to get `sid`/`sub` claims.
+
+Use a dedicated Redis database for sessions (e.g., DB 1) separate from cache (DB 0).
+
+### URL Construction (`buildAbsoluteUrl`)
+
+The private `buildAbsoluteUrl()` method handles reverse proxy headers (`X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`). Important edge case: Kubernetes Ingress often sends `X-Forwarded-Port: 80` even for HTTPS traffic — the method normalizes this by using the standard port for the detected scheme instead.
 
 ### Integration Pattern
 
 Typical Nette presenter integration:
-1. Login action: Redirect to `$oidc->getAuthorizationUrl()`
-2. Callback action: Call `$oidc->handleCallback()` to get user info, then login user
-3. The callback URL must match the `redirectUri` configured in config.neon
+1. `actionLogin()`: `$this->redirectUrl($this->oidc->getAuthorizationUrl())`
+2. `actionCallback()`: `$userInfo = $this->oidc->handleCallback()`, then login user
+3. `actionLogout()`: `$idToken = $this->oidc->getIdToken()`, then `$this->oidc->logout()`, then `$this->redirectUrl($this->oidc->getLogoutUrl($idToken))`
+4. `actionOutSlo()`: Read `logout_token` POST param, call `$this->oidc->handleBackchannelLogout($token)`, respond HTTP 200
 
 ### Configuration
 
-Extension registration in `config.neon`:
 ```neon
 extensions:
     openid: Sitmpcz\oidc\DI\OpenIDExtension
@@ -63,42 +83,18 @@ openid:
     issuerUrl: %env.ISSUER_URL%
     clientId: %env.CLIENT_ID%
     clientSecret: %env.CLIENT_SECRET%
-    redirectUri: "/sign/callback"  # optional, auto-generated from request if not provided
-    postLogoutRedirectUri: "/"  # optional, relative path (domain added automatically)
-    backchannelLogoutUri: "/sign/out-slo"  # optional, for SSO, relative path
-    scopes: [openid, profile, email]  # optional, these are defaults
+    redirectUri: "/sign/callback"          # optional, auto-generated from request if omitted
+    postLogoutRedirectUri: "/"             # optional
+    backchannelLogoutUri: "/sign/out-slo"  # optional, enables SSO back-channel logout
+    scopes: [openid, profile, email]       # optional, these are defaults
 ```
 
-**Note**: All URI parameters now support relative paths. The service automatically converts them to absolute URLs using the current HTTP request's scheme, host, and port. You can still provide absolute URLs if needed.
+For Keycloak: set **Backchannel Logout URL** in Client Settings to `https://your-domain.cz/sign/out-slo` and enable **Backchannel Logout Session Required**.
 
-**Reverse Proxy Support**: When running behind a reverse proxy, the service automatically detects and uses `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` headers to build correct absolute URLs (e.g., HTTPS URLs when SSL is terminated at the proxy).
+## Development
 
-## Development Commands
-
-This is a library package with no build or test infrastructure currently configured.
-
-### Composer
+No test infrastructure is configured. Install dependencies with:
 
 ```bash
-# Install dependencies
 composer install
-
-# Update dependencies
-composer update
 ```
-
-## Dependencies
-
-Key libraries:
-- `nette/di` ^3.1: Dependency injection container
-- `nette/http` ^3.1: HTTP request/response and session management
-- `facile-it/php-openid-client` ^0.3.5: Core OIDC client implementation
-- `web-token/jwt-framework` ^3.4: JWT token validation
-- `contributte/psr7-http-message` ^0.10.0: PSR-7 bridge for Nette HTTP objects
-
-## Notes
-
-- Minimum PHP version: 8.1
-- The service constructs the authorization URL immediately in the constructor
-- Callback processing expects standard OAuth2/OIDC query parameters from the identity provider
-- Token refresh is handled separately via the `refreshToken()` method (not automatic)

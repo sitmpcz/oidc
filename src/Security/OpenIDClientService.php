@@ -40,34 +40,20 @@ final class OpenIDClientService
         $this->section = $session->getSection('oidc');
         $issuer = (new IssuerBuilder())->build($issuerUrl);
 
-        // Pokud není zadáno redirectUri, vygeneruj z aktuálního URL
-        if (!$redirectUri) {
-            $redirectUri = $this->buildAbsoluteUrl($netteRequest->getUrl()->getPath());
-        } else {
-            // Pokud je zadáno jako relativní cesta, přidej doménu
-            $redirectUri = $this->buildAbsoluteUrl($redirectUri);
-        }
-
-        // Normalizuj postLogoutRedirectUri a backchannelLogoutUri
-        if ($postLogoutRedirectUri) {
-            $postLogoutRedirectUri = $this->buildAbsoluteUrl($postLogoutRedirectUri);
-        }
-
-        if ($backchannelLogoutUri) {
-            $backchannelLogoutUri = $this->buildAbsoluteUrl($backchannelLogoutUri);
-        }
+        $redirectUri = $this->buildAbsoluteUrl($redirectUri ?? $netteRequest->getUrl()->getPath());
+        $postLogoutRedirectUri = $postLogoutRedirectUri ? $this->buildAbsoluteUrl($postLogoutRedirectUri) : null;
+        $backchannelLogoutUri  = $backchannelLogoutUri  ? $this->buildAbsoluteUrl($backchannelLogoutUri)  : null;
 
         $metadata = [
             'client_id' => $clientId,
             'client_secret' => $clientSecret,
             'redirect_uris' => [$redirectUri],
             'post_logout_redirect_uris' => $postLogoutRedirectUri ? [$postLogoutRedirectUri] : [],
+            ...($backchannelLogoutUri ? [
+                'backchannel_logout_uri' => $backchannelLogoutUri,
+                'backchannel_logout_session_required' => true,
+            ] : []),
         ];
-
-        if ($backchannelLogoutUri) {
-            $metadata['backchannel_logout_uri'] = $backchannelLogoutUri;
-            $metadata['backchannel_logout_session_required'] = true;
-        }
 
         $clientMetadata = ClientMetadata::fromArray($metadata);
 
@@ -83,21 +69,9 @@ final class OpenIDClientService
 
     public function getAuthorizationUrl(): string
     {
-        // Vygeneruj URL s explicitním scope parametrem
-        $uri = $this->authService->getAuthorizationUri($this->client, []);
-
-        // Rozparsuj URL a nahraď scope parametr
-        $parts = parse_url($uri);
-        parse_str($parts['query'] ?? '', $params);
-
-        // Nastav scope explicitně (přepíše automaticky vygenerované)
-        $params['scope'] = implode(' ', $this->scopes);
-
-        // Sestav URL zpět
-        $query = http_build_query($params);
-        return $parts['scheme'] . '://' . $parts['host'] .
-               (isset($parts['port']) ? ':' . $parts['port'] : '') .
-               $parts['path'] . '?' . $query;
+        return $this->authService->getAuthorizationUri($this->client, [
+            'scope' => implode(' ', $this->scopes),
+        ]);
     }
 
     public function handleCallback(): array
@@ -123,10 +97,10 @@ final class OpenIDClientService
     {
         if($this->section->get('refreshToken')){
             try {
-                $tokenSet = $this->authService->grant($this->client, array_merge([], [
+                $tokenSet = $this->authService->grant($this->client, [
                     'grant_type' => 'refresh_token',
                     'refresh_token' => $this->section->get('refreshToken'),
-                ]));
+                ]);
                 $this->section->set('refreshToken',$tokenSet->getRefreshToken());
                 return true;
             } catch (\RuntimeException $e) {
@@ -225,15 +199,8 @@ final class OpenIDClientService
                 $currentClaims = $currentJwt->claims();
 
                 // Porovnej podle sid (session ID) nebo sub (subject/user ID)
-                $shouldLogout = false;
-
-                if ($sid && $currentClaims->has('sid') && $currentClaims->get('sid') === $sid) {
-                    $shouldLogout = true;
-                }
-
-                if ($sub && $currentClaims->has('sub') && $currentClaims->get('sub') === $sub) {
-                    $shouldLogout = true;
-                }
+                $shouldLogout = ($sid && $currentClaims->has('sid') && $currentClaims->get('sid') === $sid)
+                    || ($sub && $currentClaims->has('sub') && $currentClaims->get('sub') === $sub);
 
                 if ($shouldLogout) {
                     $this->logout();
@@ -269,16 +236,18 @@ final class OpenIDClientService
         // X-Forwarded-Port pro port za proxy
         $forwardedPort = $this->netteRequest->getHeader('X-Forwarded-Port');
 
+        $standardPort = $scheme === 'https' ? 443 : 80;
+
         if ($forwardedPort) {
             $port = (int) $forwardedPort;
             // Pokud X-Forwarded-Port je standardní port pro schéma, ignoruj ho
             // (K8s Ingress často nastavuje X-Forwarded-Port: 80 i pro HTTPS)
             if (($scheme === 'https' && $port === 80) || ($scheme === 'http' && $port === 443)) {
-                $port = ($scheme === 'https') ? 443 : 80;
+                $port = $standardPort;
             }
         } elseif ($forwardedProto) {
             // Za reverse proxy bez explicitního portu - použij standardní port pro schéma
-            $port = ($scheme === 'https') ? 443 : 80;
+            $port = $standardPort;
         } else {
             // Není proxy - použij skutečný port
             $port = $url->getPort();
