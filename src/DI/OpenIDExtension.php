@@ -18,7 +18,7 @@ final class OpenIDExtension extends CompilerExtension
             'redirectUri' => Expect::string()->nullable()->dynamic(),
             'postLogoutRedirectUri' => Expect::string()->nullable()->dynamic(),
             'backchannelLogoutUri' => Expect::string()->nullable()->dynamic(),
-            'scopes' => Expect::listOf('string')->default([]),
+            'scopes' => Expect::listOf('string')->nullable(),
         ]);
     }
 
