@@ -18,7 +18,7 @@ final class OpenIDExtension extends CompilerExtension
             'redirectUri' => Expect::string()->nullable()->dynamic(),
             'postLogoutRedirectUri' => Expect::string()->nullable()->dynamic(),
             'backchannelLogoutUri' => Expect::string()->nullable()->dynamic(),
-            'scopes' => Expect::listOf('string')->default(['openid', 'profile', 'email']),
+            'scopes' => Expect::listOf('string')->default([]),
         ]);
     }
 
@@ -27,13 +27,15 @@ final class OpenIDExtension extends CompilerExtension
         $builder = $this->getContainerBuilder();
         $config = $this->config;
 
+        $scopes = $config->scopes ?: ['openid', 'profile', 'email'];
+
         $builder->addDefinition($this->prefix('client'))
             ->setFactory(OpenIDClientService::class, [
                 $config->issuerUrl,
                 $config->clientId,
                 $config->clientSecret,
                 $config->redirectUri,
-                $config->scopes,
+                $scopes,
                 'netteRequest' => '@Nette\Http\Request',
                 'session' => '@Nette\Http\Session',
                 'postLogoutRedirectUri' => $config->postLogoutRedirectUri,
