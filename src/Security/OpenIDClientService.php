@@ -7,15 +7,13 @@ use Facile\OpenIDClient\Client\ClientBuilder;
 use Facile\OpenIDClient\Client\ClientInterface;
 use Facile\OpenIDClient\Client\Metadata\ClientMetadata;
 use Facile\OpenIDClient\Issuer\IssuerBuilder;
-use Facile\OpenIDClient\Service\AuthenticationService;
 use Facile\OpenIDClient\Service\AuthorizationService;
 use Facile\OpenIDClient\Service\Builder\AuthorizationServiceBuilder;
 use Facile\OpenIDClient\Service\Builder\UserInfoServiceBuilder;
-use Facile\OpenIDClient\Token\TokenVerifierBuilder;
+use Facile\OpenIDClient\Token\IdTokenVerifierBuilder;
 use Nette\Http\Request;
 use Nette\Http\Session;
 use Nette\Http\SessionSection;
-use Jose\Component\Core\JWKSet;
 
 final class OpenIDClientService
 {
@@ -27,15 +25,15 @@ final class OpenIDClientService
     private SessionSection $section;
 
     public function __construct(
-        string $issuerUrl,
-        string $clientId,
-        ?string $clientSecret,
-        ?string $redirectUri,
-        array $scopes,
-        private Request $netteRequest,
-        private Session $session,
-        ?string $postLogoutRedirectUri = null,
-        ?string $backchannelLogoutUri = null
+        string                   $issuerUrl,
+        string                   $clientId,
+        ?string                  $clientSecret,
+        ?string                  $redirectUri,
+        array                    $scopes,
+        private readonly Request $netteRequest,
+        Session                  $session,
+        ?string                  $postLogoutRedirectUri = null,
+        ?string                  $backchannelLogoutUri = null
     ) {
         $this->section = $session->getSection('oidc');
         $issuer = (new IssuerBuilder())->build($issuerUrl);
@@ -157,54 +155,55 @@ final class OpenIDClientService
     public function handleBackchannelLogout(string $logoutToken): bool
     {
         try {
-            // Ověř logout token
-            $tokenVerifier = (new TokenVerifierBuilder())
-                ->build();
-
-            $jwt = $tokenVerifier->verify($this->client, $logoutToken);
-            $claims = $jwt->claims();
+            // Ověř podpis a standardní claims logout tokenu
+            $verifier = (new IdTokenVerifierBuilder())->build($this->client);
+            $claims = $verifier->verify($logoutToken);
 
             // Validace logout tokenu podle OIDC specifikace
             // https://openid.net/specs/openid-connect-backchannel-1_0.html
 
-            // 1. Musí obsahovat 'iss' a 'aud'
-            if (!$claims->has('iss') || !$claims->has('aud')) {
-                throw new \RuntimeException('Invalid logout token: missing iss or aud');
-            }
-
-            // 2. Musí obsahovat 'events' s 'http://schemas.openid.net/event/backchannel-logout'
-            $events = $claims->get('events');
+            // 1. Musí obsahovat 'events' s 'http://schemas.openid.net/event/backchannel-logout'
+            $events = $claims['events'] ?? null;
             if (!isset($events['http://schemas.openid.net/event/backchannel-logout'])) {
                 throw new \RuntimeException('Invalid logout token: missing backchannel-logout event');
             }
 
-            // 3. Nesmí obsahovat 'nonce'
-            if ($claims->has('nonce')) {
+            // 2. Nesmí obsahovat 'nonce'
+            if (isset($claims['nonce'])) {
                 throw new \RuntimeException('Invalid logout token: nonce is not allowed');
             }
 
-            // 4. Musí obsahovat buď 'sid' nebo 'sub'
-            $sid = $claims->get('sid', null);
-            $sub = $claims->get('sub', null);
+            // 3. Musí obsahovat buď 'sid' nebo 'sub'
+            $sid = $claims['sid'] ?? null;
+            $sub = $claims['sub'] ?? null;
 
             if (!$sid && !$sub) {
                 throw new \RuntimeException('Invalid logout token: missing sid or sub');
             }
 
-            // Najdi a odhlás session podle sid nebo sub
+            // Porovnej s aktuální session — dekóduj uložený ID token bez re-verifikace
+            // (ID token v session může být expirovaný, ale sid/sub jsou stále platné)
             $currentIdToken = $this->section->get('idToken');
             if ($currentIdToken) {
-                // Dekóduj aktuální ID token pro porovnání
-                $currentJwt = $tokenVerifier->verify($this->client, $currentIdToken);
-                $currentClaims = $currentJwt->claims();
+                $parts = explode('.', $currentIdToken);
+                $b64 = strtr($parts[1] ?? '', '-_', '+/');
+                $b64 = str_pad($b64, strlen($b64) + (4 - strlen($b64) % 4) % 4, '=');
+                $currentClaims = json_decode(base64_decode($b64), true);
 
-                // Porovnej podle sid (session ID) nebo sub (subject/user ID)
-                $shouldLogout = ($sid && $currentClaims->has('sid') && $currentClaims->get('sid') === $sid)
-                    || ($sub && $currentClaims->has('sub') && $currentClaims->get('sub') === $sub);
+                if (is_array($currentClaims)) {
+                    $currentSid = $currentClaims['sid'] ?? null;
+                    $currentSub = $currentClaims['sub'] ?? null;
 
-                if ($shouldLogout) {
-                    $this->logout();
-                    return true;
+                    if ($sid !== null) {
+                        $shouldLogout = $currentSid === $sid;
+                    } else {
+                        $shouldLogout = $sub !== null && $currentSub === $sub;
+                    }
+
+                    if ($shouldLogout) {
+                        $this->logout();
+                        return true;
+                    }
                 }
             }
 

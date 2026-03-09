@@ -94,13 +94,15 @@ final class SignPresenter extends Presenter
     public function actionCallback(): void
     {
         $userinfo = $this->oidc->handleCallback();
+        
+        // Použijte eventuelně vlastní Authenticator pro přiřazení rolí a oprávnění
         $this->getUser()->login($userinfo['preferred_username']);
         $this->redirect('Homepage:');
     }
 
     public function actionLogout(): void
     {
-        // Získat ID token pro správné odhlášení z OIDC providera
+        // Získat ID token před odhlášením (nutný pro id_token_hint v OIDC logout URL)
         $idToken = $this->oidc->getIdToken();
 
         // Vyčistit lokální session
@@ -127,7 +129,6 @@ final class SignPresenter extends Presenter
             $success = $this->oidc->handleBackchannelLogout($logoutToken);
 
             if ($success) {
-                // Odhlásit uživatele z Nette
                 $this->getUser()->logout(true);
             }
 
@@ -238,85 +239,67 @@ final class SignPresenter extends Presenter
      * Backchannel logout endpoint - vyhledává sessions v Redis podle sid/sub
      * URL: /sign/out-slo
      */
+    #[Requires(methods: 'POST')]
     public function actionOutSlo(): void
     {
-        $this->getHttpResponse()->setContentType('application/json');
+        $logoutToken = $this->getHttpRequest()->getPost('logout_token');
 
+        if (!$logoutToken) {
+            $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
+            $this->sendJson(['error' => 'logout_token parameter is required']);
+        }
+
+        // Validate JWT logout token signature per OIDC spec
         try {
-            $logoutToken = $this->getHttpRequest()->getPost('logout_token');
-
-            if (!$logoutToken) {
-                $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
-                $this->sendJson(['error' => 'logout_token parameter is required']);
-            }
-
-            // Dekóduj logout token a získej sid/sub
-            $parts = explode('.', $logoutToken);
-            if (count($parts) !== 3) {
-                $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
-                $this->sendJson(['error' => 'Invalid logout token format']);
-            }
-
-            $payload = json_decode(base64_decode(strtr($parts[1], '-_', '+/')), true);
-            $sid = $payload['sid'] ?? null;
-            $sub = $payload['sub'] ?? null;
-
-            if (!$sid && !$sub) {
-                $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
-                $this->sendJson(['error' => 'logout_token must contain sid or sub']);
-            }
-
-            // Najdi všechny session klíče v Redis
-            $sessionKeys = $this->redisSession->keys('*');
-            $deletedSessions = 0;
-
-            foreach ($sessionKeys as $sessionKey) {
-                $sessionData = $this->redisSession->get($sessionKey);
-                if (!$sessionData) {
-                    continue;
-                }
-
-                // Zkontroluj, zda session obsahuje OIDC data
-                if (strpos($sessionData, 'oidc') === false) {
-                    continue;
-                }
-
-                // Extrahuj idToken ze serializovaných session dat
-                // Formát: oidc|a:3:{s:8:"userInfo";a:...;s:7:"idToken";s:NNN:"...";
-                if (preg_match('/s:7:"idToken";s:\d+:"([^"]+)"/', $sessionData, $matches)) {
-                    $idToken = $matches[1];
-
-                    // Dekóduj ID token
-                    $idParts = explode('.', $idToken);
-                    if (count($idParts) === 3) {
-                        $idPayload = json_decode(base64_decode(strtr($idParts[1], '-_', '+/')), true);
-                        $sessionSid = $idPayload['sid'] ?? null;
-                        $sessionSub = $idPayload['sub'] ?? null;
-
-                        // Porovnej sid nebo sub
-                        if (($sid && $sessionSid === $sid) || ($sub && $sessionSub === $sub)) {
-                            // Smaž tuto session z Redis
-                            $this->redisSession->del($sessionKey);
-                            $deletedSessions++;
-                        }
-                    }
-                }
-            }
-
-            if ($deletedSessions > 0) {
-                $this->getHttpResponse()->setCode(\Nette\Http\Response::S200_OK);
-                $this->sendJson([
-                    'status' => 'logged_out',
-                    'deleted_sessions' => $deletedSessions
-                ]);
-            } else {
-                $this->getHttpResponse()->setCode(\Nette\Http\Response::S200_OK);
-                $this->sendJson(['status' => 'no_matching_session']);
-            }
-        } catch (\Exception $e) {
+            $this->oidc->handleBackchannelLogout($logoutToken);
+        } catch (\Throwable $e) {
             $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
             $this->sendJson(['error' => $e->getMessage()]);
         }
+
+        // Decode JWT claims (signature already verified above)
+        $parts = explode('.', $logoutToken);
+        $b64 = strtr($parts[1], '-_', '+/');
+        $b64 = str_pad($b64, strlen($b64) + (4 - strlen($b64) % 4) % 4, '=');
+        $payload = json_decode(base64_decode($b64), true);
+        $sid = $payload['sid'] ?? null;
+        $sub = $payload['sub'] ?? null;
+
+        // Scan all session keys in Redis using SCAN (non-blocking, unlike KEYS)
+        $cursor = '0';
+        do {
+            [$cursor, $keys] = $this->redisSession->scan($cursor, ['COUNT' => 100]);
+            foreach ($keys as $sessionKey) {
+                $sessionData = $this->redisSession->get($sessionKey);
+                if (!$sessionData || !str_contains($sessionData, 'oidc')) {
+                    continue;
+                }
+
+                // Extract idToken from serialized session data
+                // Format: oidc|a:3:{s:8:"userInfo";a:...;s:7:"idToken";s:NNN:"...";
+                if (!preg_match('/s:7:"idToken";s:\d+:"([^"]+)"/', $sessionData, $matches)) {
+                    continue;
+                }
+
+                $idParts = explode('.', $matches[1]);
+                if (count($idParts) !== 3) {
+                    continue;
+                }
+
+                $idB64 = strtr($idParts[1], '-_', '+/');
+                $idB64 = str_pad($idB64, strlen($idB64) + (4 - strlen($idB64) % 4) % 4, '=');
+                $idPayload = json_decode(base64_decode($idB64), true);
+                if (!is_array($idPayload)) {
+                    continue;
+                }
+
+                if (($sid && ($idPayload['sid'] ?? null) === $sid) || ($sub && ($idPayload['sub'] ?? null) === $sub)) {
+                    $this->redisSession->del($sessionKey);
+                }
+            }
+        } while ($cursor !== '0');
+
+        $this->sendResponse(new TextResponse(''));
     }
 }
 ```
