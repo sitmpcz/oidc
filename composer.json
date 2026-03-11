@@ -3,6 +3,7 @@
   "type": "library",
   "minimum-stability": "stable",
   "description": "Integration oidc client to Nette",
+  "license": "GPL-3.0-or-later",
   "keywords": [
     "nette",
     "keycloak"
