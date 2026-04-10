@@ -17,12 +17,14 @@ use Nette\Http\SessionSection;
 
 final class OpenIDClientService
 {
-    private AuthorizationService $authService;
-    private ClientInterface $client;
+    private ?AuthorizationService $authService = null;
+    private ?ClientInterface $client = null;
     private ?string $postLogoutRedirectUri;
     /** @var string[] */
     private array $scopes;
     private SessionSection $section;
+    private string $issuerUrl;
+    private array $clientMetadataArray;
 
     public function __construct(
         string                   $issuerUrl,
@@ -36,13 +38,12 @@ final class OpenIDClientService
         ?string                  $backchannelLogoutUri = null
     ) {
         $this->section = $session->getSection('oidc');
-        $issuer = (new IssuerBuilder())->build($issuerUrl);
 
         $redirectUri = $this->buildAbsoluteUrl($redirectUri ?? $netteRequest->getUrl()->getPath());
         $postLogoutRedirectUri = $postLogoutRedirectUri ? $this->buildAbsoluteUrl($postLogoutRedirectUri) : null;
         $backchannelLogoutUri  = $backchannelLogoutUri  ? $this->buildAbsoluteUrl($backchannelLogoutUri)  : null;
 
-        $metadata = [
+        $this->clientMetadataArray = [
             'client_id' => $clientId,
             'client_secret' => $clientSecret,
             'redirect_uris' => [$redirectUri],
@@ -53,21 +54,38 @@ final class OpenIDClientService
             ] : []),
         ];
 
-        $clientMetadata = ClientMetadata::fromArray($metadata);
-
-        $this->client = (new ClientBuilder())
-            ->setIssuer($issuer)
-            ->setClientMetadata($clientMetadata)
-            ->build();
-
-        $this->authService = (new AuthorizationServiceBuilder())->build();
+        $this->issuerUrl = $issuerUrl;
         $this->scopes = $scopes;
         $this->postLogoutRedirectUri = $postLogoutRedirectUri;
     }
 
+    // lazy load AuthorizationService
+    private function getAuthService(): AuthorizationService
+    {
+        if (is_null($this->authService)) {
+            $this->authService = (new AuthorizationServiceBuilder())->build();
+        }
+        return $this->authService;
+    }
+
+    // lazy load ClientInterface
+    private function getClient(): ClientInterface
+    {
+        if (is_null($this->client)) {
+            $issuer = (new IssuerBuilder())->build($this->issuerUrl);
+            $clientMetadata = ClientMetadata::fromArray($this->clientMetadataArray);
+            $this->client = (new ClientBuilder())
+                ->setIssuer($issuer)
+                ->setClientMetadata($clientMetadata)
+                ->build();
+        }
+        return $this->client;
+    }
+
+
     public function getAuthorizationUrl(): string
     {
-        return $this->authService->getAuthorizationUri($this->client, [
+        return $this->getAuthService()->getAuthorizationUri($this->getClient(), [
             'scope' => implode(' ', $this->scopes),
         ]);
     }
@@ -77,14 +95,14 @@ final class OpenIDClientService
         $psrRequest = Psr7ServerRequestFactory::fromNette(
             $this->netteRequest
         );
-        $callbackParams = $this->authService->getCallbackParams($psrRequest, $this->client);
-        $tokenSet = $this->authService->callback($this->client, $callbackParams);
+        $callbackParams = $this->getAuthService()->getCallbackParams($psrRequest, $this->getClient());
+        $tokenSet = $this->getAuthService()->callback($this->getClient(), $callbackParams);
         if (!$tokenSet->getIdToken()) {
             throw new \RuntimeException('Unauthorized');
         }
         $userInfoService = (new UserInfoServiceBuilder())->build();
 
-        $userInfo = $userInfoService->getUserInfo($this->client, $tokenSet);
+        $userInfo = $userInfoService->getUserInfo($this->getClient(), $tokenSet);
         $this->section->set('userInfo',$userInfo);
         $this->section->set('refreshToken',$tokenSet->getRefreshToken());
         $this->section->set('idToken',$tokenSet->getIdToken());
@@ -95,7 +113,7 @@ final class OpenIDClientService
     {
         if($this->section->get('refreshToken')){
             try {
-                $tokenSet = $this->authService->grant($this->client, [
+                $tokenSet = $this->getAuthService()->grant($this->getClient(), [
                     'grant_type' => 'refresh_token',
                     'refresh_token' => $this->section->get('refreshToken'),
                 ]);
@@ -111,7 +129,7 @@ final class OpenIDClientService
 
     public function getLogoutUrl(?string $idToken = null): string
     {
-        $issuer = $this->client->getIssuer();
+        $issuer = $this->getClient()->getIssuer();
         $endSessionEndpoint = $issuer->getMetadata()->get('end_session_endpoint');
 
         if (!$endSessionEndpoint) {
@@ -128,7 +146,7 @@ final class OpenIDClientService
             $params['post_logout_redirect_uri'] = $this->postLogoutRedirectUri;
         }
 
-        $params['client_id'] = $this->client->getMetadata()->getClientId();
+        $params['client_id'] = $this->getClient()->getMetadata()->getClientId();
 
         return $endSessionEndpoint . '?' . http_build_query($params);
     }
@@ -156,7 +174,7 @@ final class OpenIDClientService
     {
         try {
             // Ověř podpis a standardní claims logout tokenu
-            $verifier = (new IdTokenVerifierBuilder())->build($this->client);
+            $verifier = (new IdTokenVerifierBuilder())->build($this->getClient());
             $claims = $verifier->verify($logoutToken);
 
             // Validace logout tokenu podle OIDC specifikace
