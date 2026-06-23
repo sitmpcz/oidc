@@ -245,6 +245,11 @@ final class OpenIDClientService
 
         // Detekce reverse proxy - preferuj X-Forwarded-Proto před skutečným schématem
         $forwardedProto = $this->netteRequest->getHeader('X-Forwarded-Proto');
+
+        // Multiple proxy hops
+        $forwardedProto = explode(',', $forwardedProto)[0];
+        $forwardedProto = trim($forwardedProto);
+
         $scheme = $forwardedProto ?? $url->getScheme();
 
         // X-Forwarded-Host pro host za proxy
