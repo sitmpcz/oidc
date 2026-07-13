@@ -247,10 +247,11 @@ final class OpenIDClientService
         $forwardedProto = $this->netteRequest->getHeader('X-Forwarded-Proto');
 
         // Multiple proxy hops
-        $forwardedProto = explode(',', $forwardedProto)[0];
-        $forwardedProto = trim($forwardedProto);
+        if ($forwardedProto !== null) {
+            $forwardedProto = trim(explode(',', $forwardedProto)[0]);
+        }
 
-        $scheme = $forwardedProto ?? $url->getScheme();
+        $scheme = $forwardedProto !== null && $forwardedProto !== '' ? $forwardedProto : $url->getScheme();
 
         // X-Forwarded-Host pro host za proxy
         $host = $this->netteRequest->getHeader('X-Forwarded-Host') ?? $url->getHost();
