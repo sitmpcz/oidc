@@ -28,10 +28,11 @@ openid:
     issuerUrl: %env.ISSUER_URL%              # URL OIDC providera
     clientId: %env.CLIENT_ID%                # Client ID z OIDC providera
     clientSecret: %env.CLIENT_SECRET%        # Client Secret z OIDC providera
-    redirectUri: "/sign/callback"            # volitelné
+    redirectUri: "/sign/callback"            # povinné
     postLogoutRedirectUri: "/"               # volitelné
     backchannelLogoutUri: "/sign/out-slo"    # volitelné
     scopes: [openid, profile, email]         # volitelné
+    idTokenSignedResponseAlg: RS256          # volitelné, výchozí RS256
 ```
 
 ### Parametry konfigurace
@@ -40,11 +41,12 @@ openid:
 |----------|---------|-------|
 | `issuerUrl` | Ano | URL vašeho OIDC providera (např. `https://keycloak.example.com/realms/myrealm`) |
 | `clientId` | Ano | Client ID z konfigurace OIDC providera |
-| `clientSecret` | Ano | Client Secret z konfigurace OIDC providera |
-| `redirectUri` | Ne | URI pro callback po přihlášení. Pokud neuvedete, použije se aktuální URL z requestu |
+| `clientSecret` | Ano | Client Secret z konfigurace OIDC providera. Knihovna podporuje pouze confidential klienty — pro public klienta by bylo potřeba PKCE, které implementované není |
+| `redirectUri` | Ano | URI pro callback po přihlášení. Musí odpovídat *Valid redirect URIs* u klienta v Keycloaku |
 | `postLogoutRedirectUri` | Ne | URI pro přesměrování po odhlášení. Výchozí: `/` |
 | `backchannelLogoutUri` | Ne | URI endpoint pro backchannel logout (Single Sign-Out) |
 | `scopes` | Ne | OIDC scopes. Výchozí: `[openid, profile, email]` |
+| `idTokenSignedResponseAlg` | Ne | Očekávaný podpisový algoritmus ID tokenu. Výchozí: `RS256`. Měňte jen když provider podepisuje jinak (Keycloak výchozí RS256) |
 
 **Relativní vs. Absolutní URL:**
 Všechny URI parametry podporují relativní cesty (např. `/sign/callback`). Knihovna automaticky doplní schéma, doménu a port z aktuálního HTTP requestu. Můžete také používat absolutní URL.
@@ -135,7 +137,9 @@ final class SignPresenter extends Presenter
             // OIDC specifikace vyžaduje HTTP 200 bez obsahu
             $this->sendResponse(new \Nette\Application\Responses\TextResponse(''));
         } catch (\RuntimeException $e) {
-            $this->error($e->getMessage(), 400);
+            // Detaily verifikace tokenu nikdy neposílej volajícímu - jen zaloguj
+            Debugger::log($e, 'oidc');
+            $this->error('Invalid logout token', 400);
         }
     }
 }
@@ -249,21 +253,19 @@ final class SignPresenter extends Presenter
             $this->sendJson(['error' => 'logout_token parameter is required']);
         }
 
-        // Validate JWT logout token signature per OIDC spec
+        // KLÍČOVÉ: ověř podpis a claims tokenu PŘED jakoukoli manipulací se session.
+        // Bez toho je endpoint neautentizovaná mazačka session pro kohokoli.
         try {
-            $this->oidc->handleBackchannelLogout($logoutToken);
-        } catch (\Throwable $e) {
+            $claims = $this->oidc->verifyLogoutToken($logoutToken);
+        } catch (\RuntimeException $e) {
+            // Nevracej $e->getMessage() - leakuje detaily verifikace tokenu
+            Debugger::log($e, 'oidc');
             $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
-            $this->sendJson(['error' => $e->getMessage()]);
+            $this->sendResponse(new TextResponse(''));
         }
 
-        // Decode JWT claims (signature already verified above)
-        $parts = explode('.', $logoutToken);
-        $b64 = strtr($parts[1], '-_', '+/');
-        $b64 = str_pad($b64, strlen($b64) + (4 - strlen($b64) % 4) % 4, '=');
-        $payload = json_decode(base64_decode($b64), true);
-        $sid = $payload['sid'] ?? null;
-        $sub = $payload['sub'] ?? null;
+        $sid = $claims['sid'] ?? null;
+        $sub = $claims['sub'] ?? null;
 
         // Scan all session keys in Redis using SCAN (non-blocking, unlike KEYS)
         $cursor = '0';
@@ -271,7 +273,7 @@ final class SignPresenter extends Presenter
             [$cursor, $keys] = $this->redisSession->scan($cursor, ['COUNT' => 100]);
             foreach ($keys as $sessionKey) {
                 $sessionData = $this->redisSession->get($sessionKey);
-                if (!$sessionData || !str_contains($sessionData, 'oidc')) {
+                if (!$sessionData) {
                     continue;
                 }
 
@@ -281,24 +283,25 @@ final class SignPresenter extends Presenter
                     continue;
                 }
 
-                $idParts = explode('.', $matches[1]);
-                if (count($idParts) !== 3) {
+                // Token z vlastního storage, podpis už ověřený při přihlášení
+                $idPayload = OpenIDClientService::decodeJwtPayload($matches[1]);
+                if ($idPayload === null) {
                     continue;
                 }
 
-                $idB64 = strtr($idParts[1], '-_', '+/');
-                $idB64 = str_pad($idB64, strlen($idB64) + (4 - strlen($idB64) % 4) % 4, '=');
-                $idPayload = json_decode(base64_decode($idB64), true);
-                if (!is_array($idPayload)) {
-                    continue;
-                }
+                // sid má přednost; sub se použije jen když sid v logout tokenu není
+                $match = $sid !== null
+                    ? ($idPayload['sid'] ?? null) === $sid
+                    : ($sub !== null && ($idPayload['sub'] ?? null) === $sub);
 
-                if (($sid && ($idPayload['sid'] ?? null) === $sid) || ($sub && ($idPayload['sub'] ?? null) === $sub)) {
+                if ($match) {
                     $this->redisSession->del($sessionKey);
                 }
             }
         } while ($cursor !== '0');
 
+        // Spec vyžaduje prázdnou 200 - počet smazaných session neposílej,
+        // byl by to oracle na to, kdo je právě přihlášený
         $this->sendResponse(new TextResponse(''));
     }
 }
@@ -320,30 +323,40 @@ final class SignPresenter extends Presenter
    - TTL pro Redis session klíče odpovídající session expiraci
    - Monitoring počtu aktivních sessions
 
-4. **Bezpečnost**: Backchannel endpoint neověřuje JWT logout token - v produkčním prostředí zvažte přidání validace tokenu pomocí `OpenIDClientService::handleBackchannelLogout()` před vyhledáváním v Redis.
+4. **Bezpečnost — nejdůležitější bod celé sekce**: `verifyLogoutToken()` musí být zavoláno **před** vyhledáváním v Redis a `sid`/`sub` se musí brát z jeho návratové hodnoty, ne z ručně dekódovaného JWT. Endpoint je veřejný a neautentizovaný; bez ověření podpisu maže session komukoli, kdo pošle vlastní nepodepsaný token.
+
+5. **Nikdy nepoužívej `KEYS *`** — blokuje celý Redis po dobu průchodu keyspace, takže neautentizovaný POST na tenhle endpoint se stává DoS na všechny session. Vždy `SCAN`, jako v příkladu.
+
+6. **Neposílej v odpovědi počet smazaných session** — útočník by iterováním `sub` zjistil, kdo je právě přihlášený. Spec chce prázdnou 200.
 
 ## Dostupné metody
 
 ### `getAuthorizationUrl(): string`
-Vrací URL pro přesměrování na přihlašovací stránku OIDC providera.
+Vrací URL pro přesměrování na přihlašovací stránku OIDC providera. Vygeneruje `state` a `nonce`, uloží je do session a přidá do URL. Musí být zavoláno ve stejné session, ve které pak proběhne `handleCallback()`.
 
 ### `handleCallback(): array`
-Zpracuje callback z OIDC providera a vrátí informace o uživateli.
+Zpracuje callback z OIDC providera a vrátí informace o uživateli. Před vydáním dat ověří `state` a `nonce` a vygeneruje nové session ID. Hodí `RuntimeException`, pokud v session není čekající authorization request, pokud `state` nesouhlasí nebo pokud `nonce` v ID tokenu neodpovídá — na callback tedy nelze přijít „zvenčí", flow musí vždy začít voláním `getAuthorizationUrl()`.
 
 ### `refreshToken(): bool`
-Obnoví access token pomocí refresh tokenu. Vrací `true` při úspěchu, `false` při selhání.
+Obnoví tokeny pomocí uloženého refresh tokenu a aktualizuje v session `refreshToken` a `idToken`. Vrací `true` při úspěchu, `false` když v session žádný refresh token není nebo ho provider odmítl. Když provider při rotaci nový refresh token nevrátí, ponechá se ten stávající.
 
 ### `getLogoutUrl(?string $idToken = null): string`
 Vrací URL pro odhlášení z OIDC providera. Při zadání ID tokenu poskytuje lepší single sign-out.
 
 ### `logout(): void`
-Vyčistí lokální session (userInfo, refreshToken, idToken).
+Vyčistí lokální session (userInfo, refreshToken, idToken, rozpracovaný state/nonce) a vygeneruje nové session ID.
 
 ### `getIdToken(): ?string`
 Vrací uložený ID token ze session, pokud existuje.
 
 ### `handleBackchannelLogout(string $logoutToken): bool`
-Zpracuje backchannel logout požadavek z OIDC providera (např. Keycloak). Validuje JWT logout token a odhlásí lokální session, pokud token odpovídá aktuálnímu uživateli. Vrací `true` pokud byla session odhlášena.
+Zpracuje backchannel logout požadavek z OIDC providera (např. Keycloak). Validuje JWT logout token a odhlásí lokální session, pokud token odpovídá aktuálnímu uživateli. Vrací `true` pokud byla session odhlášena. Vidí **jen session aktuálního requestu** — provider volá endpoint server-to-server bez cookie, takže při odděleném session storage použij `verifyLogoutToken()`.
+
+### `verifyLogoutToken(string $logoutToken): array`
+Ověří podpis logout tokenu proti JWKS providera a jeho claims podle spec (`events`, zákaz `nonce`, přítomnost `sid`/`sub`) a vrátí **verifikované claims**. Se session nijak nemanipuluje. Použij ji, když si session hledáš sám (typicky napříč Redisem) — vrácené claims jsou důvěryhodné, ručně dekódovaný JWT nikdy. Hodí `RuntimeException`, pokud je token nevalidní.
+
+### `decodeJwtPayload(string $jwt): ?array`
+Statická pomocná metoda: rozparsuje payload JWT **bez ověření podpisu**. Používej jen na tokeny, které už jsi ověřil, nebo na tokeny z vlastní session (např. ID token uložený v Redisu). Na vstup od klienta nikdy — k tomu je `verifyLogoutToken()`.
 
 ## Backchannel Logout (Single Sign-Out)
 
@@ -366,6 +379,22 @@ Backchannel logout umožňuje OIDC provideru automaticky odhlásit uživatele z 
 
 Token je validován podle [OIDC Back-Channel Logout specifikace](https://openid.net/specs/openid-connect-backchannel-1_0.html) a session je spárována podle `sid` (session ID) nebo `sub` (subject/user ID).
 
+## Zabezpečení
+
+Co knihovna dělá:
+
+- **`state`** — každý authorization request je svázán s konkrétní session. Chrání proti CSRF a authorization code injection (podstrčení cizího `code`).
+- **`nonce`** — ID token musí obsahovat `nonce` odpovídající session. Chrání proti replay ID tokenu. Kontrola je explicitní: token bez `nonce` je odmítnut, nejen token s nesprávným `nonce`.
+- **Připnutý podpisový algoritmus** — `id_token_signed_response_alg` se posílá v client metadatech, takže verifikátor přijme jen ten jeden algoritmus. Bez toho by ho vybíral podpisový header tokenu.
+- **Regenerace session ID** při přihlášení a odhlášení — ochrana proti session fixation.
+
+Co knihovna **nedělá** a co si musíš zajistit sám:
+
+- **PKCE není implementováno.** Pro confidential klienta (se `clientSecret`) je náhradou `nonce`, viz RFC 9700. Public klient touto knihovnou podporovaný není, proto je `clientSecret` povinný.
+- **Hlavičky `X-Forwarded-*` se berou bez omezení.** `buildAbsoluteUrl()` jim věří, takže musíš mít nakonfigurovanou trusted proxy (`Nette\Http\RequestFactory::setProxy()`), nebo — bezpečněji — zadat `redirectUri`, `postLogoutRedirectUri` a `backchannelLogoutUri` jako absolutní URL.
+- **Backchannel logout nemá ochranu proti replay.** `jti` se nikam neukládá, odposlechnutý `logout_token` lze přehrávat do jeho expirace (vynucené odhlašování).
+- **Chybové hlášky neposílej klientovi.** Zprávy z výjimek obsahují detaily verifikace tokenu; na backchannel endpointu vracej jen prázdné 400.
+
 ## Klíčové vlastnosti
 
 - Automatické sestavování absolutních URL z relativních cest
@@ -377,4 +406,4 @@ Token je validován podle [OIDC Back-Channel Logout specifikace](https://openid.
 
 ## Licence
 
-MIT
+GPL-3.0-or-later — viz [LICENSE](LICENSE).

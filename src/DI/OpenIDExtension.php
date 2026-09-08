@@ -14,11 +14,12 @@ final class OpenIDExtension extends CompilerExtension
         return Expect::structure([
             'issuerUrl' => Expect::string()->required()->dynamic(),
             'clientId' => Expect::string()->required()->dynamic(),
-            'clientSecret' => Expect::string()->nullable()->dynamic(),
-            'redirectUri' => Expect::string()->nullable()->dynamic(),
+            'clientSecret' => Expect::string()->required()->dynamic(),
+            'redirectUri' => Expect::string()->required()->dynamic(),
             'postLogoutRedirectUri' => Expect::string()->nullable()->dynamic(),
             'backchannelLogoutUri' => Expect::string()->nullable()->dynamic(),
             'scopes' => Expect::listOf('string')->default(['openid', 'profile', 'email'])->mergeDefaults(false),
+            'idTokenSignedResponseAlg' => Expect::string('RS256')->dynamic(),
         ]);
     }
 
@@ -38,6 +39,7 @@ final class OpenIDExtension extends CompilerExtension
                 'session' => '@Nette\Http\Session',
                 'postLogoutRedirectUri' => $config->postLogoutRedirectUri,
                 'backchannelLogoutUri' => $config->backchannelLogoutUri,
+                'idTokenSignedResponseAlg' => $config->idTokenSignedResponseAlg,
             ]);
     }
 }

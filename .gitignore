@@ -1,0 +1,8 @@
+/vendor/
+
+# Knihovna - lock file patří aplikaci, ne balíčku
+/composer.lock
+
+# IDE
+/.idea/
+/.vscode/
