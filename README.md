@@ -32,7 +32,7 @@ openid:
     postLogoutRedirectUri: "/"               # volitelné
     backchannelLogoutUri: "/sign/out-slo"    # volitelné
     scopes: [openid, profile, email]         # volitelné
-    idTokenSignedResponseAlg: RS256          # volitelné, výchozí RS256
+    idTokenSignedResponseAlg: EdDSA          # volitelné, výchozí EdDSA
 ```
 
 ### Parametry konfigurace
@@ -46,7 +46,7 @@ openid:
 | `postLogoutRedirectUri` | Ne | URI pro přesměrování po odhlášení. Výchozí: `/` |
 | `backchannelLogoutUri` | Ne | URI endpoint pro backchannel logout (Single Sign-Out) |
 | `scopes` | Ne | OIDC scopes. Výchozí: `[openid, profile, email]` |
-| `idTokenSignedResponseAlg` | Ne | Očekávaný podpisový algoritmus ID tokenu. Výchozí: `RS256`. Měňte jen když provider podepisuje jinak (Keycloak výchozí RS256) |
+| `idTokenSignedResponseAlg` | Ne | Očekávaný podpisový algoritmus ID tokenu. Výchozí: `EdDSA`, protože tak podepisuje realm, pro který je knihovna primárně určená. Keycloak má ve výchozím stavu `RS256`, takže proti jinému realmu je nutné to přepsat. Musí odpovídat přesně, jinak přihlášení skončí na `Invalid token provided` |
 
 **Relativní vs. Absolutní URL:**
 Všechny URI parametry podporují relativní cesty (např. `/sign/callback`). Knihovna automaticky doplní schéma, doménu a port z aktuálního HTTP requestu. Můžete také používat absolutní URL.
@@ -419,6 +419,19 @@ Co knihovna dělá:
 - **`nonce`** — ID token musí obsahovat `nonce` odpovídající session. Chrání proti replay ID tokenu. Kontrola je explicitní: token bez `nonce` je odmítnut, nejen token s nesprávným `nonce`.
 - **Připnutý podpisový algoritmus** — `id_token_signed_response_alg` se posílá v client metadatech, takže verifikátor si zaregistruje `AlgorithmChecker` a přijme jen ten jeden algoritmus. Bez toho žádný allow-list neplatí, algoritmus si vybírá header tokenu a mezi podporovanými je i `none`, jehož `verify()` vrací `true` pro prázdný podpis bez kontroly typu klíče. Krylo to jen to, že JWKS obvykle u klíčů `alg` uvádí. Platí i pro backchannel logout token, ověřuje se stejným builderem.
 - **Regenerace session ID** při přihlášení a odhlášení — ochrana proti session fixation.
+
+### Zjištění algoritmu u providera
+
+Hodnota `idTokenSignedResponseAlg` musí přesně odpovídat tomu, čím provider podepisuje. Ověříš to na JWKS endpointu:
+
+```bash
+curl -s https://keycloak.example.com/realms/sitmp/protocol/openid-connect/certs \
+  | jq '.keys[] | select(.use == "sig") | {kid, kty, alg, crv}'
+```
+
+V Keycloaku je to **Realm Settings → Tokens → Default Signature Algorithm**, plus per-client override v **Client → Advanced → ID Token Signature Algorithm**, který má přednost. Zkontroluj obojí.
+
+**Omezení u EdDSA:** `web-token/jwt-framework` podporuje pouze křivku **Ed25519**. Když má klíč v JWKS `"crv": "Ed448"`, knihovna ho neověří za žádné konfigurace — na to je potřeba realm přepnout na Ed25519 nebo na RSA/EC algoritmus.
 
 Co knihovna **nedělá** a co si musíš zajistit sám:
 

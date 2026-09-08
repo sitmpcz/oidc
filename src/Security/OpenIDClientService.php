@@ -39,7 +39,7 @@ final class OpenIDClientService
         Session                  $session,
         ?string                  $postLogoutRedirectUri = null,
         ?string                  $backchannelLogoutUri = null,
-        string                   $idTokenSignedResponseAlg = 'RS256'
+        string                   $idTokenSignedResponseAlg = 'EdDSA'
     ) {
         $this->session = $session;
         $this->section = $session->getSection('oidc');

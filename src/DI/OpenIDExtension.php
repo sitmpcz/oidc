@@ -19,7 +19,9 @@ final class OpenIDExtension extends CompilerExtension
             'postLogoutRedirectUri' => Expect::string()->nullable()->dynamic(),
             'backchannelLogoutUri' => Expect::string()->nullable()->dynamic(),
             'scopes' => Expect::listOf('string')->default(['openid', 'profile', 'email'])->mergeDefaults(false),
-            'idTokenSignedResponseAlg' => Expect::string('RS256')->dynamic(),
+            // EdDSA, protože realm sitmp podepisuje EdDSA, ne výchozím RS256 Keycloaku.
+            // Jiný provider si to musí přepsat.
+            'idTokenSignedResponseAlg' => Expect::string('EdDSA')->dynamic(),
         ]);
     }
 

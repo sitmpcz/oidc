@@ -13,7 +13,8 @@ This is a Nette framework extension library (`sitmpcz/oidc`) that integrates Ope
 1. **OpenIDExtension** (`src/DI/OpenIDExtension.php`): Nette DI extension that registers the OpenID client service
    - Validates configuration using Nette Schema
    - Accepts: `issuerUrl`, `clientId`, `clientSecret`, `redirectUri` (all **required** — `clientSecret` because only confidential clients are supported, PKCE is not implemented; `redirectUri` because deriving it from the request path is never what you want), `postLogoutRedirectUri`, `backchannelLogoutUri`, `scopes`, `idTokenSignedResponseAlg`
-   - Default scopes: `['openid', 'profile', 'email']`; default `idTokenSignedResponseAlg`: `RS256`
+   - Default scopes: `['openid', 'profile', 'email']`; default `idTokenSignedResponseAlg`: `EdDSA` — the `sitmp` realm this library targets signs ID tokens with EdDSA, not Keycloak's own `RS256` default. Verified end-to-end against that realm. Any other provider has to override it, or login fails with `Invalid token provided`
+   - `web-token/jwt-framework` only implements the **Ed25519** curve for EdDSA; an `Ed448` key in the JWKS cannot be verified at any configuration (`JWKFactory::createOKPKey('Ed448')` throws `Unsupported "Ed448" curve`). The `sitmp` realm uses Ed25519
    - All URI parameters support relative paths (domain is added automatically)
 
 2. **OpenIDClientService** (`src/Security/OpenIDClientService.php`): Main service handling OIDC flows
@@ -108,7 +109,7 @@ openid:
     postLogoutRedirectUri: "/"             # optional
     backchannelLogoutUri: "/sign/out-slo"  # optional, enables SSO back-channel logout
     scopes: [openid, profile, email]       # optional, these are defaults
-    idTokenSignedResponseAlg: RS256        # optional, this is the default
+    idTokenSignedResponseAlg: EdDSA        # optional, this is the default
 ```
 
 For Keycloak: set **Backchannel Logout URL** in Client Settings to `https://your-domain.cz/sign/out-slo` and enable **Backchannel Logout Session Required**.
