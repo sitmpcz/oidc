@@ -60,6 +60,8 @@ Pokud běžíte za reverse proxy (nginx, Apache) nebo v Kubernetes Ingress, knih
 
 Ujistěte se, že vaše proxy tyto hlavičky správně nastavuje.
 
+> **Pozor:** knihovna těmto hlavičkám věří bez ověření, že request skutečně přišel od tvé proxy. Kdokoli je může poslat a ovlivnit tím sestavené `redirect_uri`. Nastav trusted proxy (`Nette\Http\RequestFactory::setProxy()`), nebo zadej URI parametry jako absolutní URL — pak se hlavičky nepoužijí vůbec. Viz [Zabezpečení](#zabezpečení).
+
 **Příklad pro nginx:**
 ```nginx
 proxy_set_header X-Forwarded-Proto $scheme;
@@ -79,8 +81,11 @@ declare(strict_types=1);
 
 namespace App\Presenters;
 
+use Nette\Application\Attributes\Requires;
+use Nette\Application\Responses\TextResponse;
 use Nette\Application\UI\Presenter;
 use Sitmpcz\oidc\Security\OpenIDClientService;
+use Tracy\Debugger;
 
 final class SignPresenter extends Presenter
 {
@@ -95,8 +100,17 @@ final class SignPresenter extends Presenter
 
     public function actionCallback(): void
     {
-        $userinfo = $this->oidc->handleCallback();
-        
+        try {
+            $userinfo = $this->oidc->handleCallback();
+        } catch (\RuntimeException $e) {
+            // Vypršelá session, nesouhlasící state, login otevřený ve dvou tabech.
+            // Nepřesměrovávej zpět na actionLogin - hned by spustil nový OIDC flow
+            // a při trvale nepřenesené cookie by vznikla redirect smyčka.
+            Debugger::log($e, 'oidc');
+            $this->flashMessage('Přihlášení vypršelo, zkuste to prosím znovu.', 'danger');
+            $this->redirect('Homepage:');
+        }
+
         // Použijte eventuelně vlastní Authenticator pro přiřazení rolí a oprávnění
         $this->getUser()->login($userinfo['preferred_username']);
         $this->redirect('Homepage:');
@@ -118,13 +132,20 @@ final class SignPresenter extends Presenter
     /**
      * Endpoint pro backchannel logout - volá ho Keycloak při odhlášení z jiné aplikace
      * URL: /sign/out-slo
+     *
+     * POZOR: handleBackchannelLogout() vidí jen session aktuálního requestu.
+     * Keycloak volá tenhle endpoint server-to-server bez session cookie, takže
+     * ve většině nasazení nebude co spárovat. Tahle varianta je použitelná jen
+     * tam, kde si session dohledáš sám - viz sekce o Redis sessions níže.
      */
+    #[Requires(methods: 'POST')]
     public function actionOutSlo(): void
     {
         $logoutToken = $this->getHttpRequest()->getPost('logout_token');
 
-        if (!$logoutToken) {
-            $this->error('Missing logout_token', 400);
+        if (!is_string($logoutToken) || $logoutToken === '') {
+            $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
+            $this->sendResponse(new TextResponse(''));
         }
 
         try {
@@ -133,14 +154,15 @@ final class SignPresenter extends Presenter
             if ($success) {
                 $this->getUser()->logout(true);
             }
-
-            // OIDC specifikace vyžaduje HTTP 200 bez obsahu
-            $this->sendResponse(new \Nette\Application\Responses\TextResponse(''));
         } catch (\RuntimeException $e) {
             // Detaily verifikace tokenu nikdy neposílej volajícímu - jen zaloguj
             Debugger::log($e, 'oidc');
-            $this->error('Invalid logout token', 400);
+            $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
+            $this->sendResponse(new TextResponse(''));
         }
+
+        // OIDC specifikace vyžaduje HTTP 200 bez obsahu
+        $this->sendResponse(new TextResponse(''));
     }
 }
 ```
@@ -201,9 +223,12 @@ declare(strict_types=1);
 
 namespace App\Presenters;
 
+use Nette\Application\Attributes\Requires;
+use Nette\Application\Responses\TextResponse;
 use Nette\Application\UI\Presenter;
 use Sitmpcz\oidc\Security\OpenIDClientService;
 use Predis\ClientInterface as RedisClient;
+use Tracy\Debugger;
 
 final class SignPresenter extends Presenter
 {
@@ -219,7 +244,14 @@ final class SignPresenter extends Presenter
 
     public function actionCallback(): void
     {
-        $userinfo = $this->oidc->handleCallback();
+        try {
+            $userinfo = $this->oidc->handleCallback();
+        } catch (\RuntimeException $e) {
+            Debugger::log($e, 'oidc');
+            $this->flashMessage('Přihlášení vypršelo, zkuste to prosím znovu.', 'danger');
+            $this->redirect('Homepage:');
+        }
+
         $this->getUser()->login($userinfo['preferred_username']);
         $this->redirect('Homepage:');
     }
@@ -248,9 +280,9 @@ final class SignPresenter extends Presenter
     {
         $logoutToken = $this->getHttpRequest()->getPost('logout_token');
 
-        if (!$logoutToken) {
+        if (!is_string($logoutToken) || $logoutToken === '') {
             $this->getHttpResponse()->setCode(\Nette\Http\Response::S400_BadRequest);
-            $this->sendJson(['error' => 'logout_token parameter is required']);
+            $this->sendResponse(new TextResponse(''));
         }
 
         // KLÍČOVÉ: ověř podpis a claims tokenu PŘED jakoukoli manipulací se session.
@@ -341,7 +373,7 @@ Zpracuje callback z OIDC providera a vrátí informace o uživateli. Před vydá
 Obnoví tokeny pomocí uloženého refresh tokenu a aktualizuje v session `refreshToken` a `idToken`. Vrací `true` při úspěchu, `false` když v session žádný refresh token není nebo ho provider odmítl. Když provider při rotaci nový refresh token nevrátí, ponechá se ten stávající.
 
 ### `getLogoutUrl(?string $idToken = null): string`
-Vrací URL pro odhlášení z OIDC providera. Při zadání ID tokenu poskytuje lepší single sign-out.
+Vrací end-session URL OIDC providera. Při zadání ID tokenu ho přidá jako `id_token_hint`, což provideru umožní odhlásit konkrétní session bez dotazu uživateli. Hodí `RuntimeException`, pokud provider `end_session_endpoint` v discovery dokumentu nemá.
 
 ### `logout(): void`
 Vyčistí lokální session (userInfo, refreshToken, idToken, rozpracovaný state/nonce) a vygeneruje nové session ID.
@@ -377,7 +409,7 @@ Backchannel logout umožňuje OIDC provideru automaticky odhlásit uživatele z 
 3. Aplikace B validuje JWT `logout_token` a odhlásí uživatele
 4. Uživatel je nyní odhlášen ze všech aplikací (Single Sign-Out)
 
-Token je validován podle [OIDC Back-Channel Logout specifikace](https://openid.net/specs/openid-connect-backchannel-1_0.html) a session je spárována podle `sid` (session ID) nebo `sub` (subject/user ID).
+Token je validován podle [OIDC Back-Channel Logout specifikace](https://openid.net/specs/openid-connect-backchannel-1_0.html). Session se páruje podle `sid` (session ID); `sub` (subject/user ID) se použije jen tehdy, když token `sid` neobsahuje — jinak by odhlášení jedné session shodilo všechny session daného uživatele.
 
 ## Zabezpečení
 
@@ -385,7 +417,7 @@ Co knihovna dělá:
 
 - **`state`** — každý authorization request je svázán s konkrétní session. Chrání proti CSRF a authorization code injection (podstrčení cizího `code`).
 - **`nonce`** — ID token musí obsahovat `nonce` odpovídající session. Chrání proti replay ID tokenu. Kontrola je explicitní: token bez `nonce` je odmítnut, nejen token s nesprávným `nonce`.
-- **Připnutý podpisový algoritmus** — `id_token_signed_response_alg` se posílá v client metadatech, takže verifikátor přijme jen ten jeden algoritmus. Bez toho by ho vybíral podpisový header tokenu.
+- **Připnutý podpisový algoritmus** — `id_token_signed_response_alg` se posílá v client metadatech, takže verifikátor si zaregistruje `AlgorithmChecker` a přijme jen ten jeden algoritmus. Bez toho žádný allow-list neplatí, algoritmus si vybírá header tokenu a mezi podporovanými je i `none`, jehož `verify()` vrací `true` pro prázdný podpis bez kontroly typu klíče. Krylo to jen to, že JWKS obvykle u klíčů `alg` uvádí. Platí i pro backchannel logout token, ověřuje se stejným builderem.
 - **Regenerace session ID** při přihlášení a odhlášení — ochrana proti session fixation.
 
 Co knihovna **nedělá** a co si musíš zajistit sám:
@@ -397,12 +429,14 @@ Co knihovna **nedělá** a co si musíš zajistit sám:
 
 ## Klíčové vlastnosti
 
+- Authorization code flow s `state` a `nonce` svázanými se session
+- Ověření ID tokenu proti JWKS providera s připnutým algoritmem
+- Regenerace session ID při přihlášení a odhlášení
+- Front-channel a backchannel logout, včetně ověření logout tokenu
+- Obnova tokenů přes refresh token (voláním `refreshToken()`, ne automaticky)
+- Správa session v Nette session storage
 - Automatické sestavování absolutních URL z relativních cest
 - Podpora reverse proxy a Kubernetes Ingress
-- Front-channel a backchannel logout
-- Správa session v Nette session storage
-- Automatická obnova tokenů přes refresh token
-- JWT validace podle OIDC standardů
 
 ## Licence
 
