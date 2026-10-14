@@ -32,7 +32,7 @@ openid:
     postLogoutRedirectUri: "/"               # volitelné
     backchannelLogoutUri: "/sign/out-slo"    # volitelné
     scopes: [openid, profile, email]         # volitelné
-    idTokenSignedResponseAlg: EdDSA          # volitelné, výchozí EdDSA
+    idTokenSigningAlgs: [RS256, EdDSA]       # volitelné, výchozí všechny asymetrické
 ```
 
 ### Parametry konfigurace
@@ -46,7 +46,8 @@ openid:
 | `postLogoutRedirectUri` | Ne | URI pro přesměrování po odhlášení. Výchozí: `/` |
 | `backchannelLogoutUri` | Ne | URI endpoint pro backchannel logout (Single Sign-Out) |
 | `scopes` | Ne | OIDC scopes. Výchozí: `[openid, profile, email]` |
-| `idTokenSignedResponseAlg` | Ne | Očekávaný podpisový algoritmus ID tokenu. Výchozí: `EdDSA`, protože tak podepisuje realm, pro který je knihovna primárně určená. Keycloak má ve výchozím stavu `RS256`, takže proti jinému realmu je nutné to přepsat. Musí odpovídat přesně, jinak přihlášení skončí na `Invalid token provided` |
+| `idTokenSigningAlgs` | Ne | Allow-list podpisových algoritmů ID tokenu (a backchannel logout tokenu). Výchozí: všechny asymetrické — `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA` — takže typicky není potřeba nic nastavovat. Seznam se navíc zúží na průnik s `id_token_signing_alg_values_supported` z discovery (`.well-known/openid-configuration`); discovery ho jen zužuje, nikdy nerozšíří. `none` a `HS*` povolit nejde, konfigurace s nimi neprojde validací. Zúžit seznam má smysl, když víš, čím provider podepisuje |
+| `idTokenSignedResponseAlg` | Ne | **Zastaralé.** Jeden povolený algoritmus, ekvivalent `idTokenSigningAlgs: [<alg>]`. Nelze kombinovat s `idTokenSigningAlgs` |
 
 **Relativní vs. Absolutní URL:**
 Všechny URI parametry podporují relativní cesty (např. `/sign/callback`). Knihovna automaticky doplní schéma, doménu a port z aktuálního HTTP requestu. Můžete také používat absolutní URL.
@@ -417,12 +418,12 @@ Co knihovna dělá:
 
 - **`state`** — každý authorization request je svázán s konkrétní session. Chrání proti CSRF a authorization code injection (podstrčení cizího `code`).
 - **`nonce`** — ID token musí obsahovat `nonce` odpovídající session. Chrání proti replay ID tokenu. Kontrola je explicitní: token bez `nonce` je odmítnut, nejen token s nesprávným `nonce`.
-- **Připnutý podpisový algoritmus** — `id_token_signed_response_alg` se posílá v client metadatech, takže verifikátor si zaregistruje `AlgorithmChecker` a přijme jen ten jeden algoritmus. Bez toho žádný allow-list neplatí, algoritmus si vybírá header tokenu a mezi podporovanými je i `none`, jehož `verify()` vrací `true` pro prázdný podpis bez kontroly typu klíče. Krylo to jen to, že JWKS obvykle u klíčů `alg` uvádí. Platí i pro backchannel logout token, ověřuje se stejným builderem.
+- **Allow-list podpisových algoritmů** — povolené jsou jen asymetrické algoritmy (`idTokenSigningAlgs`). Verifier (`AlgAllowListIdTokenVerifier`) přečte `alg` z hlavičky tokenu, odmítne ho, pokud není v allow-listu, a jinak ho upstream verifieru připne přes `withExpectedAlg()`, takže ten si zaregistruje `AlgorithmChecker`. Bez připnutého algoritmu si ho vybírá header tokenu a mezi podporovanými je i `none`, jehož `verify()` vrací `true` pro prázdný podpis bez kontroly typu klíče, a `HS*`, podepsané `client_secret`, který zná i klient. Mezi asymetrickými algoritmy výběr bezpečný je: podpis bez privátního klíče providera nevyrobíš a `jwt-framework` kontroluje, že typ klíče z JWKS odpovídá algoritmu. Platí i pro backchannel logout token, ověřuje se stejným builderem.
 - **Regenerace session ID** při přihlášení a odhlášení — ochrana proti session fixation.
 
 ### Zjištění algoritmu u providera
 
-Hodnota `idTokenSignedResponseAlg` musí přesně odpovídat tomu, čím provider podepisuje. Ověříš to na JWKS endpointu:
+Výchozí allow-list pokrývá všechny běžné algoritmy, takže tohle potřebuješ jen při zužování `idTokenSigningAlgs` nebo při ladění `Invalid token provided`. Čím provider podepisuje, ověříš na JWKS endpointu:
 
 ```bash
 curl -s https://keycloak.example.com/realms/sitmp/protocol/openid-connect/certs \
@@ -443,7 +444,7 @@ Co knihovna **nedělá** a co si musíš zajistit sám:
 ## Klíčové vlastnosti
 
 - Authorization code flow s `state` a `nonce` svázanými se session
-- Ověření ID tokenu proti JWKS providera s připnutým algoritmem
+- Ověření ID tokenu proti JWKS providera s allow-listem asymetrických algoritmů
 - Regenerace session ID při přihlášení a odhlášení
 - Front-channel a backchannel logout, včetně ověření logout tokenu
 - Obnova tokenů přes refresh token (voláním `refreshToken()`, ne automaticky)

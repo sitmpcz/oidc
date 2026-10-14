@@ -11,7 +11,6 @@ use Facile\OpenIDClient\Service\AuthorizationService;
 use Facile\OpenIDClient\Service\Builder\AuthorizationServiceBuilder;
 use Facile\OpenIDClient\Service\Builder\UserInfoServiceBuilder;
 use Facile\OpenIDClient\Session\AuthSession;
-use Facile\OpenIDClient\Token\IdTokenVerifierBuilder;
 use function Facile\OpenIDClient\parse_callback_params;
 use Nette\Http\Request;
 use Nette\Http\Session;
@@ -28,6 +27,7 @@ final class OpenIDClientService
     private Session $session;
     private string $issuerUrl;
     private array $clientMetadataArray;
+    private AsymmetricIdTokenVerifierBuilder $idTokenVerifierBuilder;
 
     public function __construct(
         string                   $issuerUrl,
@@ -39,8 +39,21 @@ final class OpenIDClientService
         Session                  $session,
         ?string                  $postLogoutRedirectUri = null,
         ?string                  $backchannelLogoutUri = null,
-        string                   $idTokenSignedResponseAlg = 'EdDSA'
+        /** @deprecated use $idTokenSigningAlgs */
+        ?string                  $idTokenSignedResponseAlg = null,
+        /** @var list<string>|null null = all asymmetric algorithms */
+        ?array                   $idTokenSigningAlgs = null
     ) {
+        if ($idTokenSignedResponseAlg !== null && $idTokenSigningAlgs !== null) {
+            throw new \InvalidArgumentException('Set either idTokenSigningAlgs or the deprecated idTokenSignedResponseAlg, not both');
+        }
+
+        // Allow-list asymetrických algoritmů - "none" ani HS* neprojdou ani přes konfiguraci
+        $this->idTokenVerifierBuilder = new AsymmetricIdTokenVerifierBuilder(
+            $idTokenSigningAlgs
+                ?? ($idTokenSignedResponseAlg !== null ? [$idTokenSignedResponseAlg] : AsymmetricIdTokenVerifierBuilder::SUPPORTED_ALGS)
+        );
+
         $this->session = $session;
         $this->section = $session->getSection('oidc');
 
@@ -51,9 +64,6 @@ final class OpenIDClientService
         $this->clientMetadataArray = [
             'client_id' => $clientId,
             'client_secret' => $clientSecret,
-            // Pinning the algorithm registers an AlgorithmChecker in the verifier.
-            // Without it the verifier accepts any alg the provider's JWKS allows - including "none".
-            'id_token_signed_response_alg' => $idTokenSignedResponseAlg,
             'redirect_uris' => [$redirectUri],
             'post_logout_redirect_uris' => $postLogoutRedirectUri ? [$postLogoutRedirectUri] : [],
             ...($backchannelLogoutUri ? [
@@ -71,7 +81,9 @@ final class OpenIDClientService
     private function getAuthService(): AuthorizationService
     {
         if (is_null($this->authService)) {
-            $this->authService = (new AuthorizationServiceBuilder())->build();
+            $this->authService = (new AuthorizationServiceBuilder())
+                ->setIdTokenVerifierBuilder($this->idTokenVerifierBuilder)
+                ->build();
         }
         return $this->authService;
     }
@@ -284,7 +296,7 @@ final class OpenIDClientService
     {
         try {
             // Ověř podpis a standardní claims logout tokenu
-            $verifier = (new IdTokenVerifierBuilder())->build($this->getClient());
+            $verifier = $this->idTokenVerifierBuilder->build($this->getClient());
             $claims = $verifier->verify($logoutToken);
 
             // Validace logout tokenu podle OIDC specifikace

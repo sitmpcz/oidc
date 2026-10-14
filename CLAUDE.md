@@ -12,8 +12,8 @@ This is a Nette framework extension library (`sitmpcz/oidc`) that integrates Ope
 
 1. **OpenIDExtension** (`src/DI/OpenIDExtension.php`): Nette DI extension that registers the OpenID client service
    - Validates configuration using Nette Schema
-   - Accepts: `issuerUrl`, `clientId`, `clientSecret`, `redirectUri` (all **required** — `clientSecret` because only confidential clients are supported, PKCE is not implemented; `redirectUri` because deriving it from the request path is never what you want), `postLogoutRedirectUri`, `backchannelLogoutUri`, `scopes`, `idTokenSignedResponseAlg`
-   - Default scopes: `['openid', 'profile', 'email']`; default `idTokenSignedResponseAlg`: `EdDSA` — the `sitmp` realm this library targets signs ID tokens with EdDSA, not Keycloak's own `RS256` default. Verified end-to-end against that realm. Any other provider has to override it, or login fails with `Invalid token provided`
+   - Accepts: `issuerUrl`, `clientId`, `clientSecret`, `redirectUri` (all **required** — `clientSecret` because only confidential clients are supported, PKCE is not implemented; `redirectUri` because deriving it from the request path is never what you want), `postLogoutRedirectUri`, `backchannelLogoutUri`, `scopes`, `idTokenSigningAlgs`, `idTokenSignedResponseAlg` (deprecated single-alg alias, mutually exclusive with `idTokenSigningAlgs`)
+   - Default scopes: `['openid', 'profile', 'email']`; default `idTokenSigningAlgs`: every asymmetric alg (`AsymmetricIdTokenVerifierBuilder::SUPPORTED_ALGS` — RS*, PS*, ES*, EdDSA), so no provider needs configuration. At `build()` the list is intersected with the provider's discovery `id_token_signing_alg_values_supported` (unchanged if the field is absent; `RuntimeException` if the intersection is empty) — discovery can only narrow it. `none` and `HS*` are rejected by both the schema and the builder constructor
    - `web-token/jwt-framework` only implements the **Ed25519** curve for EdDSA; an `Ed448` key in the JWKS cannot be verified at any configuration (`JWKFactory::createOKPKey('Ed448')` throws `Unsupported "Ed448" curve`). The `sitmp` realm uses Ed25519
    - All URI parameters support relative paths (domain is added automatically)
 
@@ -46,7 +46,7 @@ Do not remove these without a replacement — each closes a specific attack:
 
 - `state` is generated per authorization request and compared with `hash_equals` in `handleCallback()`. Without it, an attacker can replay their own `code` to log a victim into the attacker's account.
 - `nonce` is generated per request and its presence in the ID token is asserted explicitly. The upstream `NonceChecker` only runs when the claim exists (`Jose\Component\Checker\ClaimCheckerManager::check()` skips absent claims), so an ID token with no `nonce` would otherwise pass silently. Since PKCE is not implemented, `nonce` is the only defence against authorization code injection (RFC 9700 accepts it for confidential clients).
-- `id_token_signed_response_alg` is set in `clientMetadataArray`, which makes the verifier register an `AlgorithmChecker`. Without it `expectedAlg` is `null`, no algorithm allow-list applies, and the verifier's algorithm manager includes `Algorithm\None` whose `verify()` returns `true` for an empty signature without checking the key type — forgeable against any IdP whose JWKS omits `alg` on a signing key. This also covers the backchannel logout token, which is verified with the same builder.
+- Every ID token / logout token verifier comes from `AsymmetricIdTokenVerifierBuilder` (passed to `AuthorizationServiceBuilder::setIdTokenVerifierBuilder()` and used in `verifyLogoutToken()`). Its `AlgAllowListIdTokenVerifier` checks the header `alg` against the allow-list, then pins it with `withExpectedAlg()` so upstream registers an `AlgorithmChecker`. `id_token_signed_response_alg` is deliberately **not** in `clientMetadataArray` — any verifier built with the upstream default builder would therefore have `expectedAlg = null`, no allow-list, and an algorithm manager that includes `Algorithm\None` (whose `verify()` returns `true` for an empty signature without checking the key type) and `HS*` (keyed by the client secret). Never build an ID token verifier any other way. Choosing among asymmetric algs is safe: forging needs the provider's private key and `jwt-framework` checks key type and JWK `alg` against the algorithm.
 - `regenerateSessionId()` runs on login and logout to prevent session fixation.
 
 ### Not implemented / known gaps
@@ -109,7 +109,7 @@ openid:
     postLogoutRedirectUri: "/"             # optional
     backchannelLogoutUri: "/sign/out-slo"  # optional, enables SSO back-channel logout
     scopes: [openid, profile, email]       # optional, these are defaults
-    idTokenSignedResponseAlg: EdDSA        # optional, this is the default
+    idTokenSigningAlgs: [RS256, EdDSA]     # optional, default = all asymmetric (RS*, PS*, ES*, EdDSA)
 ```
 
 For Keycloak: set **Backchannel Logout URL** in Client Settings to `https://your-domain.cz/sign/out-slo` and enable **Backchannel Logout Session Required**.

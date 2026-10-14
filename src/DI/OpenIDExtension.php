@@ -2,6 +2,7 @@
 
 namespace Sitmpcz\oidc\DI;
 
+use Sitmpcz\oidc\Security\AsymmetricIdTokenVerifierBuilder;
 use Sitmpcz\oidc\Security\OpenIDClientService;
 use Nette\DI\CompilerExtension;
 use Nette\Schema\Expect;
@@ -19,9 +20,13 @@ final class OpenIDExtension extends CompilerExtension
             'postLogoutRedirectUri' => Expect::string()->nullable()->dynamic(),
             'backchannelLogoutUri' => Expect::string()->nullable()->dynamic(),
             'scopes' => Expect::listOf('string')->default(['openid', 'profile', 'email'])->mergeDefaults(false),
-            // EdDSA, protože realm sitmp podepisuje EdDSA, ne výchozím RS256 Keycloaku.
-            // Jiný provider si to musí přepsat.
-            'idTokenSignedResponseAlg' => Expect::string('EdDSA')->dynamic(),
+            // Povolené podpisové algoritmy ID tokenu. Výchozí jsou všechny asymetrické
+            // (RS*, PS*, ES*, EdDSA) - "none" a HS* povolit nejde.
+            'idTokenSigningAlgs' => Expect::listOf(Expect::anyOf(...AsymmetricIdTokenVerifierBuilder::SUPPORTED_ALGS))
+                ->default(null)
+                ->mergeDefaults(false),
+            // Zastaralé, jeden algoritmus - použij idTokenSigningAlgs
+            'idTokenSignedResponseAlg' => Expect::string()->nullable()->dynamic(),
         ]);
     }
 
@@ -42,6 +47,7 @@ final class OpenIDExtension extends CompilerExtension
                 'postLogoutRedirectUri' => $config->postLogoutRedirectUri,
                 'backchannelLogoutUri' => $config->backchannelLogoutUri,
                 'idTokenSignedResponseAlg' => $config->idTokenSignedResponseAlg,
+                'idTokenSigningAlgs' => $config->idTokenSigningAlgs,
             ]);
     }
 }
