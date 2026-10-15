@@ -6,3 +6,5 @@
 # IDE
 /.idea/
 /.vscode/
+# Claude Code
+/CLAUDE.md
